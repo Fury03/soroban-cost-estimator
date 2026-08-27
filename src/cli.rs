@@ -158,4 +158,11 @@ pub enum ConfigAction {
         #[arg(long, default_value = "testnet")]
         network: String,
     },
+
+    /// Validate all stored snapshots for integrity.
+    Validate {
+        /// Network whose snapshots to validate.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
 }

@@ -13,10 +13,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // Logs go to stderr so stdout stays machine-parseable for `--json`
+    // consumers (tracing's default writer is stdout).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let args = cli::Cli::parse();

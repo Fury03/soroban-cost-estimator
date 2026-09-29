@@ -78,6 +78,27 @@ fn cache_filename(wasm_hash: &str, function: &str, args_hash: &str) -> String {
     format!("{wasm_hash}-{function}-{args_hash}.json")
 }
 
+/// Builds the cache key for an estimate: the filename its entry is stored
+/// under.
+///
+/// The key strictly includes the **full 64-character hex SHA-256 hash of the
+/// entire WASM binary** together with the function name and the SHA-256 of
+/// the argument values, so changing even a single WASM byte produces a
+/// different key — a recompiled contract can never collide with (or reuse)
+/// the previous build's cached estimate. [`load_estimate`] additionally
+/// re-validates that a located entry's stored hashes match the requested key
+/// before serving it, so a tampered or mis-keyed file is treated as a cache
+/// miss rather than a stale hit.
+///
+/// The network is recorded inside each entry but is deliberately not part of
+/// the filename key: changing the on-disk layout is a schema migration (see
+/// [`CACHE_SCHEMA_VERSION`]) and out of scope here.
+#[must_use]
+pub fn derive_cache_key(wasm_hash: &str, function: &str, args: &[String]) -> String {
+    let args_hash = hash_args(args);
+    cache_filename(wasm_hash, function, &args_hash)
+}
+
 /// Save an estimate result to the cache.
 ///
 /// # Arguments
@@ -186,6 +207,23 @@ pub fn load_estimate(
     let cached: CachedEstimate =
         serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
     let cached = migrate_to_latest(cached)?;
+
+    // Never serve an entry whose stored hashes disagree with the key it was
+    // found under: that signature means the file was tampered with, mis-keyed,
+    // or corrupted after being written, and trusting it would report an
+    // estimate for a different contract build or argument set. Treat it as a
+    // cache miss so the caller re-simulates and overwrites the entry.
+    if cached.wasm_hash != wasm_hash || cached.args_hash != args_hash {
+        warn!(
+            requested_wasm_hash = wasm_hash,
+            stored_wasm_hash = %cached.wasm_hash,
+            requested_args_hash = args_hash,
+            stored_args_hash = %cached.args_hash,
+            "cache entry key does not match its stored hashes — treating as a miss"
+        );
+        return Ok(None);
+    }
+
     Ok(Some(cached))
 }
 

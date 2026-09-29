@@ -297,6 +297,137 @@ fn test_verify_cache_ignores_non_json_files() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Cache-key derivation and WASM-hash invalidation (#336)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Distinct wasm hashes must derive distinct cache keys — a recompiled
+/// contract (even a one-byte WASM change) can never collide with the
+/// previous build's entry.
+#[test]
+fn test_derive_cache_key_separates_wasm_hashes() {
+    let key_a = cache::derive_cache_key("hash_aaa", "f1", &[]);
+    let key_b = cache::derive_cache_key("hash_bbb", "f1", &[]);
+
+    assert_ne!(
+        key_a, key_b,
+        "different wasm hashes must produce different keys"
+    );
+    // The full hash is embedded in the key.
+    assert!(key_a.starts_with("hash_aaa-"));
+    assert!(key_a.contains("-f1-"));
+    assert!(key_a.ends_with(".json"));
+}
+
+/// A real one-byte WASM change must produce a different key: two bytes
+/// arrays differing in a single position hash differently.
+#[test]
+fn test_single_byte_wasm_change_produces_new_cache_key() {
+    use sha2::Digest;
+
+    let original = b"\0asm\x01\x00\x00\x00 byte-for-byte fixture";
+    let mut modified = *original;
+    modified[13] ^= 0x01; // flip one bit in one byte
+
+    let hash_original = hex::encode(sha2::Sha256::digest(original));
+    let hash_modified = hex::encode(sha2::Sha256::digest(modified));
+
+    assert_ne!(
+        hash_original, hash_modified,
+        "one flipped byte must change the SHA-256"
+    );
+    assert_ne!(
+        cache::derive_cache_key(&hash_original, "f1", &[]),
+        cache::derive_cache_key(&hash_modified, "f1", &[]),
+        "one flipped byte must produce a new cache key"
+    );
+}
+
+/// The derived key must be exactly the filename `load_estimate` resolves —
+/// including the args hash — so the key and the on-disk layout cannot drift.
+#[test]
+fn test_derive_cache_key_matches_saved_filename() {
+    with_temp_home(|tmp| {
+        cache::save_estimate(
+            "deadbeef",
+            "my_fn",
+            &["x".to_string()],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+        )
+        .expect("save");
+
+        let key = cache::derive_cache_key("deadbeef", "my_fn", &["x".to_string()]);
+        let path = tmp.join(".soroban-cost-estimator").join("cache").join(&key);
+        assert!(
+            path.exists(),
+            "derived key should be the exact saved filename: {key}"
+        );
+    });
+}
+
+/// A saved entry must load back when addressed by its own hashes.
+#[test]
+fn test_load_estimate_validates_matching_wasm_hash() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("hash_one", "f1", &[], "testnet", 7, 100, 10, 5).expect("save");
+
+        let loaded = cache::load_estimate("hash_one", "f1", &[])
+            .expect("load")
+            .expect("the matching entry must load");
+        assert_eq!(loaded.wasm_hash, "hash_one");
+        assert_eq!(loaded.ledger, 7);
+    });
+}
+
+/// A file whose stored `wasm_hash` disagrees with the requested key must
+/// never be served: the cache validates the hash before returning the entry
+/// and reports a miss, so a stale/mis-keyed estimate cannot leak through.
+#[test]
+fn test_load_estimate_rejects_mismatched_wasm_hash() {
+    with_temp_home(|tmp| {
+        // Save under hash_one, then rename the file to look like it belongs
+        // to hash_two — the on-disk signature of a mis-keyed or tampered
+        // entry.
+        cache::save_estimate("hash_one", "f1", &[], "testnet", 7, 100, 10, 5).expect("save");
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        let original = dir.join(cache::derive_cache_key("hash_one", "f1", &[]));
+        let renamed = dir.join(cache::derive_cache_key("hash_two", "f1", &[]));
+        std::fs::rename(&original, &renamed).expect("rename to mis-keyed location");
+
+        let loaded = cache::load_estimate("hash_two", "f1", &[])
+            .expect("mismatch must be a miss, not an error");
+        assert!(
+            loaded.is_none(),
+            "an entry whose stored wasm_hash does not match the key must not be served"
+        );
+    });
+}
+
+/// Same validation for the args hash: an entry carrying different argument
+/// hashes than its key requests is treated as a miss.
+#[test]
+fn test_load_estimate_rejects_mismatched_args_hash() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h", "f1", &["a".to_string()], "testnet", 1, 100, 10, 5)
+            .expect("save with args [a]");
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        let original = dir.join(cache::derive_cache_key("h", "f1", &["a".to_string()]));
+        let renamed = dir.join(cache::derive_cache_key("h", "f1", &["b".to_string()]));
+        std::fs::rename(&original, &renamed).expect("rename to mis-keyed location");
+
+        let loaded = cache::load_estimate("h", "f1", &["b".to_string()])
+            .expect("mismatch must be a miss, not an error");
+        assert!(
+            loaded.is_none(),
+            "an entry whose stored args_hash does not match the key must not be served"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Concurrency
 // ─────────────────────────────────────────────────────────────────────────
 

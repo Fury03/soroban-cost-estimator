@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cache verify --repair` (`--fix`): delete corrupted cache entries after
+  reporting them and exit `0`, instead of just naming them and exiting `1`
+  ([#342](https://github.com/Stellar-Cost-Labs/soroban-cost-estimator/issues/342)).
+- `config snapshot show`: print any stored snapshot — latest, by timestamp
+  prefix (`--at 2026-08`), or by explicit path — as readable per-category
+  tables or raw JSON
+  ([#344](https://github.com/Stellar-Cost-Labs/soroban-cost-estimator/issues/344)).
+- Automatic protocol-upgrade snapshots: when a new capture (or a `config
+  diff` / `watch` poll) sees the network's protocol version increase, the
+  snapshot is saved and tagged `protocol_upgrade_v{N}`, announced as
+  `🎉 Stellar Protocol Upgrade detected (vX -> vY). Created snapshot: <path>`
+  with a field-level diff
+  ([#343](https://github.com/Stellar-Cost-Labs/soroban-cost-estimator/issues/343)).
+- Snapshots now record the network's protocol version (`getVersionInfo`) and
+  free-form tags; older snapshots load unchanged with `(unknown)`/
+  `(not captured)` rendering.
+- `estimate` cache keys are now validated on load: a cached entry whose
+  stored WASM/args hashes do not match its filename key is ignored, so a
+  corrupted or mis-renamed cache file can never return an estimate for a
+  different contract or invocation
+  ([#336](https://github.com/Stellar-Cost-Labs/soroban-cost-estimator/issues/336)).
 - `CHANGELOG.md` following the Keep a Changelog format.
 - `docs/migration.md` — migration guide for users coming from
   `stellar contract invoke --cost`.

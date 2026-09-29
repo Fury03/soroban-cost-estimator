@@ -14,6 +14,7 @@
 - [`estimate`](commands/estimate.md)
 - [`estimate-all`](commands/estimate-all.md)
 - [`config snapshot`](commands/config-snapshot.md)
+- [`config snapshot show`](commands/config-snapshot.md#config-snapshot-show)
 - [`config diff`](commands/config-diff.md)
 - [`watch`](commands/watch.md)
 

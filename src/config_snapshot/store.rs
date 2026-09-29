@@ -7,21 +7,12 @@ use crate::error::{AppError, AppResult};
 
 /// Returns the base data directory: `~/.soroban-cost-estimator`.
 fn data_dir() -> AppResult<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::General("could not determine home directory".to_string()))?;
-    Ok(home.join(".soroban-cost-estimator"))
+    crate::paths::data_dir()
 }
 
 /// Returns the snapshots directory, creating it if needed.
 fn snapshots_dir() -> AppResult<PathBuf> {
     let dir = data_dir()?.join("snapshots");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Returns the cache directory, creating it if needed.
-pub fn cache_dir() -> AppResult<PathBuf> {
-    let dir = data_dir()?.join("cache");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -104,14 +95,13 @@ pub fn load_snapshot_from_path(path: &str) -> AppResult<ConfigSnapshot> {
     Ok(snapshot)
 }
 
-/// Lists all available snapshots for a given network.
+/// Lists all snapshots for a given network.
 ///
 /// # Network calls
 /// None — pure file I/O.
 pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
     let dir = snapshots_dir()?;
     let mut snapshots = Vec::new();
-
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -125,225 +115,159 @@ pub fn list_snapshots(network: &str) -> AppResult<Vec<PathBuf>> {
     Ok(snapshots)
 }
 
-/// Resolves a snapshot by timestamp (exact or prefix) for a network.
-///
-/// Snapshots are stored as `{network}-{timestamp}.json` (colons replaced
-/// with dashes), so matching is done over the timestamp-shaped part of the
-/// filename: the stored timestamp is normalized to the same on-disk form
-/// before comparison. A prefix like `2026-08-04` or `2026-08-04T07` selects
-/// among all snapshots from that period; when several match, the **most
-/// recent** is returned.
-///
-/// Returns [`AppError::SnapshotNotFound`] naming the requested timestamp
-/// when nothing matches.
+/// Loads a specific snapshot by network and timestamp.
 ///
 /// # Network calls
 /// None — pure file I/O.
-pub fn resolve_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<ConfigSnapshot> {
-    let needle = on_disk_timestamp(timestamp);
-    let mut best: Option<(String, PathBuf)> = None;
+pub fn load_snapshot_by_timestamp(network: &str, timestamp: &str) -> AppResult<ConfigSnapshot> {
+    let dir = snapshots_dir()?;
+    let ts_safe = timestamp.replace(':', "-");
+    let filename = format!("{}-{}.json", network, ts_safe);
+    let path = dir.join(&filename);
 
-    for path in list_snapshots(network)? {
-        let Some(stored) = snapshot_timestamp_part(&path, network) else {
-            continue;
-        };
-        if !stored.starts_with(&needle) {
-            continue;
-        }
-        // For a prefix match, keep the lexicographically greatest stored
-        // timestamp — filenames sort chronologically by construction.
-        if best.as_ref().is_none_or(|(b, _)| stored >= *b) {
-            best = Some((stored, path));
-        }
+    if !path.exists() {
+        return Err(AppError::General(format!(
+            "No snapshot found for network '{}' at timestamp '{}'",
+            network, timestamp
+        )));
     }
-
-    let (_, path) = best.ok_or_else(|| {
-        AppError::SnapshotNotFound(format!(
-            "no snapshot for network '{network}' at timestamp '{timestamp}'"
-        ))
-    })?;
 
     let content = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))
+    let snapshot: ConfigSnapshot =
+        serde_json::from_str(&content).map_err(|e| AppError::SnapshotParse(e.to_string()))?;
+    Ok(snapshot)
 }
 
-/// Counts the stored snapshots for a network.
+/// Result of validating a single snapshot file.
+#[derive(Debug, Clone)]
+pub struct SnapshotValidation {
+    pub path: PathBuf,
+    pub filename: String,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+/// Validates all stored snapshot files for a given network.
+///
+/// Each file is checked for:
+/// - Readable (file exists and is not empty)
+/// - Valid JSON (deserializes as `ConfigSnapshot`)
+/// - Non-empty network field
+/// - Non-zero ledger
+///
+/// Returns a list of validation results, one per file.
 ///
 /// # Network calls
 /// None — pure file I/O.
-pub fn count_snapshots(network: &str) -> AppResult<usize> {
-    Ok(list_snapshots(network)?.len())
-}
+pub fn validate_all_snapshots(network: &str) -> AppResult<Vec<SnapshotValidation>> {
+    let paths = list_snapshots(network)?;
+    let mut results = Vec::with_capacity(paths.len());
 
-/// Normalizes a timestamp to its on-disk filename form: colons become
-/// dashes, because `:` is not portable across filesystems.
-fn on_disk_timestamp(timestamp: &str) -> String {
-    timestamp.replace(':', "-")
-}
+    for path in paths {
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
-/// Extracts the timestamp-shaped segment between the `{network}-` prefix and
-/// the `.json` suffix of a snapshot filename. Returns `None` when the file
-/// name does not follow the store's naming convention.
-fn snapshot_timestamp_part(path: &Path, network: &str) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
-    let prefix_len = network.len() + 1;
-    if !name.starts_with(&format!("{network}-")) || !name.ends_with(".json") {
-        return None;
-    }
-    let inner_len = name
-        .len()
-        .checked_sub(prefix_len)?
-        .checked_sub(".json".len())?;
-    if inner_len == 0 {
-        return None;
-    }
-    Some(name.get(prefix_len..prefix_len + inner_len)?.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes tests that redirect `HOME` (env vars are process-global).
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Runs `f` with `HOME` pointed at a fresh temp dir, restoring it after.
-    fn with_temp_home<F, R>(label: &str, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let _guard = HOME_LOCK.lock().expect("test mutex");
-        let tmp = std::env::temp_dir().join(format!("sce-store-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).expect("create temp home");
-        let old_home = std::env::var_os("HOME");
-        // SAFETY: serialized by HOME_LOCK; no other test in this binary
-        // reads HOME.
-        unsafe {
-            std::env::set_var("HOME", &tmp);
-        }
-        let result = f();
-        // SAFETY: as above.
-        if let Some(home) = old_home {
-            unsafe {
-                std::env::set_var("HOME", home);
+        match validate_single_snapshot(&path) {
+            Ok(()) => {
+                results.push(SnapshotValidation {
+                    path,
+                    filename,
+                    valid: true,
+                    error: None,
+                });
             }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
+            Err(e) => {
+                results.push(SnapshotValidation {
+                    path,
+                    filename,
+                    valid: false,
+                    error: Some(e.to_string()),
+                });
             }
         }
-        let _ = std::fs::remove_dir_all(&tmp);
-        result
     }
 
-    fn test_snapshot(network: &str, timestamp: &str, ledger: u32) -> ConfigSnapshot {
-        ConfigSnapshot {
-            network: network.to_string(),
-            timestamp: timestamp.to_string(),
-            ledger,
-            network_protocol_version: Some(22),
-            contract_compute: None,
-            contract_ledger_cost: None,
-            contract_historical_data: None,
-            contract_events: None,
-            contract_bandwidth: None,
-            state_archival: None,
-            tags: Vec::new(),
+    Ok(results)
+}
+
+/// Validates a single snapshot file.
+fn validate_single_snapshot(path: &std::path::Path) -> AppResult<()> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| AppError::General(format!("cannot read file: {e}")))?;
+
+    if content.trim().is_empty() {
+        return Err(AppError::General("file is empty".to_string()));
+    }
+
+    let snapshot: ConfigSnapshot = serde_json::from_str(&content)
+        .map_err(|e| AppError::General(format!("invalid JSON: {e}")))?;
+
+    if snapshot.network.is_empty() {
+        return Err(AppError::General("network field is empty".to_string()));
+    }
+
+    if snapshot.ledger == 0 {
+        return Err(AppError::General("ledger is zero".to_string()));
+    }
+
+    Ok(())
+}
+
+/// A bundle of config snapshots for export/import.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotBundle {
+    pub snapshots: Vec<ConfigSnapshot>,
+}
+
+/// Exports snapshots to a single JSON bundle file.
+pub fn export_snapshots(network: Option<&str>, output_path: &str) -> AppResult<()> {
+    let dir = snapshots_dir()?;
+    let mut snapshots = Vec::new();
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name_str = entry.file_name().to_string_lossy().into_owned();
+        if !name_str.ends_with(".json") {
+            continue;
+        }
+        if let Some(net) = network {
+            if !name_str.starts_with(&format!("{}-", net)) {
+                continue;
+            }
+        }
+        let content = std::fs::read_to_string(entry.path())?;
+        if let Ok(snapshot) = serde_json::from_str::<ConfigSnapshot>(&content) {
+            snapshots.push(snapshot);
         }
     }
 
-    #[test]
-    fn test_count_snapshots_counts_only_this_network() {
-        with_temp_home("count", || {
-            save_snapshot(
-                &test_snapshot("testnet", "2026-08-01T00:00:00+00:00", 1),
-                None,
-            )
-            .expect("save testnet");
-            save_snapshot(
-                &test_snapshot("mainnet", "2026-08-02T00:00:00+00:00", 2),
-                None,
-            )
-            .expect("save mainnet");
+    let bundle = SnapshotBundle { snapshots };
+    let json = serde_json::to_string_pretty(&bundle)
+        .map_err(|e| AppError::General(format!("Failed to serialize bundle: {}", e)))?;
+    std::fs::write(output_path, json)?;
+    Ok(())
+}
 
-            assert_eq!(count_snapshots("testnet").expect("count testnet"), 1);
-            assert_eq!(count_snapshots("mainnet").expect("count mainnet"), 1);
-            assert_eq!(count_snapshots("futurenet").expect("count futurenet"), 0);
-        });
+/// Imports snapshots from a JSON bundle file.
+pub fn import_snapshots(bundle_path: &str) -> AppResult<usize> {
+    let content = std::fs::read_to_string(bundle_path)?;
+    let bundle: SnapshotBundle = serde_json::from_str(&content)
+        .map_err(|e| AppError::SnapshotParse(format!("Invalid bundle: {}", e)))?;
+
+    let mut imported = 0;
+    for snapshot in bundle.snapshots {
+        let ts_safe = snapshot.timestamp.replace(':', "-");
+        let filename = format!("{}-{}.json", snapshot.network, ts_safe);
+        let path = snapshots_dir()?.join(&filename);
+        if !path.exists() {
+            let json = serde_json::to_string_pretty(&snapshot)
+                .map_err(|e| AppError::General(format!("Failed to serialize snapshot: {}", e)))?;
+            std::fs::write(&path, json)?;
+            imported += 1;
+            println!("  Imported snapshot: {}", filename);
+        }
     }
-
-    #[test]
-    fn test_resolve_by_exact_timestamp() {
-        with_temp_home("resolve-exact", || {
-            save_snapshot(
-                &test_snapshot("testnet", "2026-08-01T00:00:00+00:00", 1),
-                None,
-            )
-            .expect("save 1");
-            save_snapshot(
-                &test_snapshot("testnet", "2026-08-02T00:00:00+00:00", 2),
-                None,
-            )
-            .expect("save 2");
-
-            let snap = resolve_snapshot_by_timestamp("testnet", "2026-08-02T00:00:00+00:00")
-                .expect("exact timestamp resolves");
-            assert_eq!(snap.ledger, 2);
-        });
-    }
-
-    #[test]
-    fn test_resolve_by_timestamp_prefix_picks_most_recent() {
-        with_temp_home("resolve-prefix", || {
-            save_snapshot(
-                &test_snapshot("testnet", "2026-08-01T07:15:00+00:00", 1),
-                None,
-            )
-            .expect("save 07:15");
-            save_snapshot(
-                &test_snapshot("testnet", "2026-08-01T19:45:00+00:00", 2),
-                None,
-            )
-            .expect("save 19:45");
-            save_snapshot(
-                &test_snapshot("testnet", "2026-08-02T00:00:00+00:00", 3),
-                None,
-            )
-            .expect("save next day");
-
-            // Day prefix: two candidates from 2026-08-01, latest (19:45) wins.
-            let day = resolve_snapshot_by_timestamp("testnet", "2026-08-01")
-                .expect("day prefix resolves");
-            assert_eq!(day.ledger, 2);
-
-            // Hour prefix resolves within the day.
-            let hour = resolve_snapshot_by_timestamp("testnet", "2026-08-01T07")
-                .expect("hour prefix resolves");
-            assert_eq!(hour.ledger, 1);
-        });
-    }
-
-    #[test]
-    fn test_resolve_by_unknown_timestamp_errors() {
-        with_temp_home("resolve-missing", || {
-            save_snapshot(
-                &test_snapshot("testnet", "2026-08-01T00:00:00+00:00", 1),
-                None,
-            )
-            .expect("save 1");
-
-            let err = resolve_snapshot_by_timestamp("testnet", "2025-01-01")
-                .expect_err("a timestamp with no snapshot must error");
-            assert!(
-                err.to_string().contains("Snapshot not found"),
-                "error must be SnapshotNotFound; got: {err}"
-            );
-            assert!(
-                err.to_string().contains("2025-01-01"),
-                "error must name the requested timestamp; got: {err}"
-            );
-        });
-    }
+    Ok(imported)
 }

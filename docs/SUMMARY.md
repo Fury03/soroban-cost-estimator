@@ -16,6 +16,10 @@
 - [`config snapshot`](commands/config-snapshot.md)
 - [`config snapshot show`](commands/config-snapshot.md#config-snapshot-show)
 - [`config diff`](commands/config-diff.md)
+- [`config history`](commands/config-history.md)
+- [`config last-changed`](commands/config-last-changed.md)
+- [`cache verify`](commands/cache-verify.md)
+- [`cache warm`](commands/cache-warm.md)
 - [`watch`](commands/watch.md)
 
 # Reference

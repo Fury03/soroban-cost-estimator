@@ -6,6 +6,7 @@ expression: MarkdownFormatter.format(&report)
 
 - **Network:** testnet (ledger 3894195)
 - **WASM hash:** `abc123def456`
+- **RPC round-trip:** 87 ms
 
 ### Resources
 
@@ -21,8 +22,15 @@ expression: MarkdownFormatter.format(&report)
 
 ### Fee Breakdown
 
-| Component | Stroops |
-| --- | --- |
-| Non-refundable | 4496 |
-| Refundable | 10931 |
-| **Total** | **15427** (0.0015427) |
+| Component | Stroops | % of Total |
+| --- | --- | --- |
+| CPU Instructions | 372 |  |
+| Storage I/O | 4063 |  |
+| Transaction Size | 61 |  |
+| Base Fee | 100 |  |
+| Rent Fee | 10931 |  |
+| **Total** | **15427** (0.0015427) | **100.0%** |
+
+### Optimization Suggestions
+
+No cost optimizations identified (fee rates unavailable or no reducible resources).

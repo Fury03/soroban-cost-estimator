@@ -1,4 +1,44 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum OutputFormat {
+    #[default]
+    Table,
+    Json,
+    Csv,
+    Markdown,
+}
+
+impl OutputFormat {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Build version string with metadata from build.rs
+fn build_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_HASH"),
+        " ",
+        env!("BUILD_DATE"),
+        ")"
+    )
+}
 
 /// Estimate Soroban contract resource costs with network config-drift tracking.
 ///
@@ -6,21 +46,87 @@ use clap::{Parser, Subcommand};
 /// network's resource-pricing configuration changes over time.
 #[derive(Parser, Debug)]
 #[command(name = "soroban-cost-estimator")]
+#[command(version = build_version())]
 #[command(about = "Estimate Soroban contract costs & track network pricing changes", long_about = None)]
 pub struct Cli {
+    /// Select output format for commands that produce structured output (table, json, csv, markdown).
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<OutputFormat>,
+
+    /// Cap RPC requests at N per second. 0 disables.
+    #[arg(long, global = true, value_name = "N")]
+    pub rps: Option<u64>,
+
+    /// HTTP request timeout for RPC calls, in seconds (applies to every
+    /// network call).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    pub timeout: u64,
+
+    /// Enable debug-level logging, including full RPC request payloads and
+    /// response summaries.
+    #[arg(long, short, global = true)]
+    pub verbose: bool,
+
+    /// Custom HTTP header to send with every RPC request, e.g.
+    /// `--header "X-API-Key: secret"`. Repeatable for multiple headers.
+    #[arg(long = "header", value_name = "KEY: VALUE", global = true)]
+    pub headers: Vec<String>,
+
+    /// Fallback RPC URL used when the primary endpoint is unreachable.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_fallback_url: Option<String>,
+
+    /// Retry transient RPC failures up to N times (default 3), using
+    /// exponential backoff (500ms, then doubled between attempts). 0
+    /// disables retries entirely.
+    #[arg(long, global = true, value_name = "N", default_value_t = 3)]
+    pub max_retries: usize,
+
+    /// Control ANSI color formatting in terminal output.
+    #[arg(long, global = true, default_value = "auto")]
+    pub color: clap::ColorChoice,
+    /// Print WASM structure information to stderr.
+    #[arg(long, global = true)]
+    pub wasm_info: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Simulate a single contract invocation and print the cost report.
     Estimate {
-        /// Path to the compiled Soroban contract `.wasm` file.
         #[arg(long, short)]
         wasm: String,
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long)]
+        r#fn: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long = "arg", value_name = "KEY=VAL")]
+        args: Vec<String>,
+        #[arg(long, value_name = "DURATION")]
+        cache_ttl: Option<String>,
 
-        /// Network to simulate against.
+        /// Wipe this network's cached estimates before running the
+        /// simulation (e.g. after upgrading the tool or a network upgrade).
+        #[arg(long)]
+        clear_cache: bool,
+
+        /// Output as JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
+    },
+    EstimateAll {
+        #[arg(long, short)]
+        wasm: String,
         #[arg(long, default_value = "testnet")]
         network: String,
 
@@ -28,108 +134,109 @@ pub enum Command {
         #[arg(long)]
         rpc_url: Option<String>,
 
-        /// Contract function name to invoke.
-        #[arg(long)]
-        r#fn: Option<String>,
-
-        /// Deployed contract ID (64 hex chars) to invoke. Required when --fn is used.
-        #[arg(long)]
-        id: Option<String>,
-
-        /// Function arguments as key=value pairs (value is type-inferred).
-        #[arg(long = "arg", value_name = "KEY=VAL")]
-        args: Vec<String>,
-
-        /// Skip re-simulation when a cached estimate is still fresh
-        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
-        #[arg(long, value_name = "DURATION")]
-        cache_ttl: Option<String>,
-
-        /// Output as JSON instead of a human-readable table.
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Enumerate all public contract functions and estimate each one.
-    EstimateAll {
-        /// Path to the compiled Soroban contract `.wasm` file.
-        #[arg(long, short)]
-        wasm: String,
-
-        /// Network to simulate against.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
+        #[arg(long)]
+        json: bool,
 
-        /// Output as JSON instead of a human-readable list.
+        /// Number of decimal places for XLM fee values (0..=18, default 7).
+        #[arg(long, default_value_t = 7)]
+        precision: u32,
+    },
+    WasmInfo {
+        #[arg(long, short)]
+        wasm: String,
         #[arg(long)]
         json: bool,
     },
-
-    /// Fetch and store a snapshot of the network's resource-pricing configuration.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
-
-    /// Poll network config on an interval and print diffs when they appear.
-    Watch {
-        /// Network to watch.
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
-        /// Polling interval (e.g. "30m", "1h").
-        #[arg(long, default_value = "1h")]
-        interval: String,
-    },
-
-    /// Inspect and manage the local estimate cache.
     Cache {
         #[command(subcommand)]
         action: CacheAction,
+    },
+    Watch {
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        #[arg(long, default_value = "1h")]
+        interval: String,
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
     },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
-    /// Check that every cached estimate is valid JSON and not corrupted.
-    Verify {
-        /// Delete corrupted cache entries instead of only reporting them.
-        #[arg(long, visible_alias = "fix")]
-        repair: bool,
+    /// Export every cached estimate as a JSON array.
+    Export {
+        /// Write the JSON array to a file instead of standard output.
+        #[arg(long, short)]
+        out: Option<String>,
     },
-}
 
-#[derive(Subcommand, Debug)]
-pub enum SnapshotAction {
-    /// Display the complete configuration stored in a historical snapshot.
-    ///
-    /// Selects the snapshot to show by explicit file path, by timestamp
-    /// (`--at`, exact or prefix within the network's snapshot history), or
-    /// the most recent one (`--latest`, also the default with no selector).
-    Show {
-        /// Snapshot file path to display (overrides `--at` and `--latest`).
-        snapshot: Option<String>,
+    /// Check that every cached estimate is valid JSON and not corrupted.
+    Verify,
 
-        /// Timestamp (exact or prefix, e.g. `2026-08-04` or `2026-08-04T07`)
-        /// of the snapshot to show. When several snapshots match the prefix,
-        /// the most recent one is used.
-        #[arg(long, conflicts_with = "snapshot")]
-        at: Option<String>,
+    /// Delete every cached estimate recorded for a network.
+    Clear {
+        /// Network whose cached estimates to delete.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
 
-        /// Show the most recent snapshot for the network.
-        #[arg(long, conflicts_with_all = ["snapshot", "at"])]
-        latest: bool,
+    /// Pre-populate the cache by estimating every exported function.
+    Warm {
+        #[arg(long, short)]
+        wasm: String,
+        #[arg(long, default_value = "testnet")]
+        network: String,
 
-        /// Network whose snapshot history to search when no explicit path
-        /// is given.
+        /// Explicit RPC URL (overrides network-based resolution).
         #[arg(long)]
-        network: Option<String>,
+        rpc_url: Option<String>,
 
-        /// Print the snapshot as JSON instead of a formatted report.
+        /// Deployed contract ID (64 hex chars) to invoke each function against.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Query cached estimates with optional filters.
+    Query {
+        /// Network to filter by.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Filter by function name (case-insensitive substring match).
+        #[arg(long)]
+        function: Option<String>,
+
+        /// Filter by WASM hash prefix.
+        #[arg(long)]
+        wasm_hash: Option<String>,
+
+        /// Minimum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        min_stroops: Option<i64>,
+
+        /// Maximum total fee in stroops.
+        #[arg(long, value_name = "STROOPS")]
+        max_stroops: Option<i64>,
+
+        /// Earliest timestamp (ISO-8601, e.g. "2024-06-01T00:00:00Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        from: Option<String>,
+
+        /// Latest timestamp (ISO-8601, e.g. "2024-12-31T23:59:59Z").
+        #[arg(long, value_name = "TIMESTAMP")]
+        to: Option<String>,
+
+        /// Output as JSON instead of a table.
         #[arg(long)]
         json: bool,
     },
@@ -137,49 +244,96 @@ pub enum SnapshotAction {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
-    /// Fetch all ConfigSetting entries and save a timestamped snapshot.
-    ///
-    /// With no subcommand, fetches and saves a new snapshot. With the `show`
-    /// subcommand, displays a stored one instead.
     Snapshot {
-        #[command(subcommand)]
-        action: Option<SnapshotAction>,
-
-        /// Network to fetch config from.
         #[arg(long, default_value = "testnet")]
         network: String,
-
-        /// Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/).
         #[arg(long)]
         out: Option<String>,
-
-        /// Print the snapshot as JSON instead of the summary lines.
         #[arg(long)]
         json: bool,
     },
 
+    /// List all saved config snapshots with their timestamp and ledger.
+    List {
+        /// Network whose snapshots to list.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+
     /// Diff the current network config against the most recent snapshot.
     Diff {
-        /// Network to compare against.
         #[arg(long, default_value = "testnet")]
         network: String,
-
-        /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
-    },
 
-    /// Show the full chronological change log across all stored snapshots.
+        /// Hide non-pricing changes and display only fee-rate adjustments.
+        #[arg(long)]
+        pricing_only: bool,
+
+        /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
+        #[arg(long, value_name = "N")]
+        threshold_percent: Option<f64>,
+
+        /// Print a single-line summary (counts of pricing/non-pricing changes)
+        /// instead of the full diff. Useful for CI status lines.
+        #[arg(long)]
+        summary: bool,
+
+        /// Output as JSON instead of a human-readable diff.
+        #[arg(long)]
+        json: bool,
+    },
     History {
-        /// Network whose snapshot history to inspect.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+    LastChanged {
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+    Validate {
         #[arg(long, default_value = "testnet")]
         network: String,
     },
 
-    /// Show when each config setting last changed.
-    LastChanged {
-        /// Network whose snapshot history to inspect.
-        #[arg(long, default_value = "testnet")]
-        network: String,
+    /// Export network snapshots to a bundle file.
+    Export {
+        /// Network to export snapshots for.
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Output file path for the snapshot bundle.
+        #[arg(long)]
+        output: String,
     },
+
+    /// Import network snapshots from a bundle file.
+    Import {
+        /// Path to the snapshot bundle file.
+        bundle: String,
+    },
+}
+use std::sync::atomic::{AtomicU8, Ordering};
+
+pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+pub fn init_color(choice: clap::ColorChoice) {
+    let val = match choice {
+        clap::ColorChoice::Auto => 0,
+        clap::ColorChoice::Always => 1,
+        clap::ColorChoice::Never => 2,
+    };
+    COLOR_CHOICE.store(val, Ordering::Relaxed);
+}
+
+pub fn should_colorize() -> bool {
+    match COLOR_CHOICE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            use std::io::IsTerminal;
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        }
+    }
 }

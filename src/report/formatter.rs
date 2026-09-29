@@ -40,9 +40,15 @@ impl ReportFormatter for TableFormatter {
             "Network: {} (ledger {})\n",
             report.network, report.ledger
         ));
+        output.push_str(&format!("RPC round-trip: {} ms\n", report.rpc_latency_ms));
         output.push_str(&format!("WASM hash: {}\n\n", report.wasm_hash));
 
         let mut table = comfy_table::Table::new();
+        if crate::cli::should_colorize() {
+            table.enforce_styling();
+        } else {
+            table.force_no_tty();
+        }
         table.set_header(vec!["Resource", "Consumed", "Fee (stroops)"]);
 
         table.add_row(vec![
@@ -60,18 +66,77 @@ impl ReportFormatter for TableFormatter {
         output.push_str(&table.to_string());
         output.push('\n');
 
-        output.push_str("\nFee Breakdown:\n");
-        output.push_str(&format!(
-            "  Non-refundable: {} stroops\n",
-            report.fee.non_refundable_stroops
+        output.push_str("\nFee Breakdown:\n\n");
+        let pct = &report.fee.fee_percentages;
+        let mut fee_table = comfy_table::Table::new();
+        fee_table.set_header(vec!["Component", "Fee"]);
+        fee_table.add_row(vec![
+            "CPU Instructions",
+            &format!(
+                "{} stroops ({})",
+                report.fee.cpu_fee_stroops,
+                pct.get("cpu_instructions")
+                    .map(String::as_str)
+                    .unwrap_or("")
+            ),
+        ]);
+        fee_table.add_row(vec![
+            "Storage I/O",
+            &format!(
+                "{} stroops ({})",
+                report.fee.storage_fee_stroops,
+                pct.get("storage_read_write")
+                    .map(String::as_str)
+                    .unwrap_or("")
+            ),
+        ]);
+        fee_table.add_row(vec![
+            "Transaction Size",
+            &format!(
+                "{} stroops ({})",
+                report.fee.bandwidth_fee_stroops,
+                pct.get("transaction_size")
+                    .map(String::as_str)
+                    .unwrap_or("")
+            ),
+        ]);
+        fee_table.add_row(vec![
+            "Base Fee",
+            &format!(
+                "{} stroops ({})",
+                report.fee.base_fee_stroops,
+                pct.get("base_fee").map(String::as_str).unwrap_or("")
+            ),
+        ]);
+        fee_table.add_row(vec![
+            "Rent Fee",
+            &format!(
+                "{} stroops ({})",
+                report.fee.refundable_stroops,
+                pct.get("rent").map(String::as_str).unwrap_or("")
+            ),
+        ]);
+        fee_table.add_row(vec![
+            "Total",
+            &format!(
+                "{} stroops ({})",
+                report.fee.total_stroops, report.fee.total_xlm
+            ),
+        ]);
+
+        output.push_str(&fee_table.to_string());
+        output.push('\n');
+
+        // ASCII bar chart for a quick visual summary of where the fee goes.
+        output.push_str(&crate::report::cost_report::format_cost_breakdown_chart(
+            report.fee.total_stroops,
+            report.fee.non_refundable_stroops,
+            report.fee.refundable_stroops,
         ));
-        output.push_str(&format!(
-            "  Refundable:     {} stroops\n",
-            report.fee.refundable_stroops
-        ));
-        output.push_str(&format!(
-            "  Total:          {} stroops ({})\n",
-            report.fee.total_stroops, report.fee.total_xlm,
+
+        output.push('\n');
+        output.push_str(&crate::report::cost_report::format_suggestions(
+            &report.suggest_optimizations(),
         ));
 
         output
@@ -93,7 +158,13 @@ pub struct JsonFormatter;
 
 impl ReportFormatter for JsonFormatter {
     fn format(&self, report: &CostReport) -> String {
-        serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+        let mut value = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+        let suggestions =
+            serde_json::to_value(report.suggest_optimizations()).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert("suggestions".to_string(), suggestions);
+        }
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
 
     fn name(&self) -> &'static str {
@@ -119,7 +190,8 @@ impl ReportFormatter for CsvFormatter {
         let mut output = String::from(
             "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,\
              read_entries,write_entries,read_bytes,write_bytes,tx_size,\
-             non_refundable_stroops,refundable_stroops,total_stroops,total_xlm\n",
+             non_refundable_stroops,refundable_stroops,total_stroops,total_xlm,\
+             rpc_latency_ms\n",
         );
 
         let row = csv_row(&[
@@ -138,6 +210,7 @@ impl ReportFormatter for CsvFormatter {
             &report.fee.refundable_stroops.to_string(),
             &report.fee.total_stroops.to_string(),
             &report.fee.total_xlm,
+            &report.rpc_latency_ms.to_string(),
         ]);
         output.push_str(&row);
         output.push('\n');
@@ -171,7 +244,11 @@ impl ReportFormatter for MarkdownFormatter {
             "- **Network:** {} (ledger {})\n",
             report.network, report.ledger
         ));
-        output.push_str(&format!("- **WASM hash:** `{}`\n\n", report.wasm_hash));
+        output.push_str(&format!("- **WASM hash:** `{}`\n", report.wasm_hash));
+        output.push_str(&format!(
+            "- **RPC round-trip:** {} ms\n\n",
+            report.rpc_latency_ms
+        ));
 
         // Resource table
         output.push_str("### Resources\n\n");
@@ -190,20 +267,60 @@ impl ReportFormatter for MarkdownFormatter {
 
         // Fee breakdown
         output.push_str("\n### Fee Breakdown\n\n");
-        output.push_str("| Component | Stroops |\n");
-        output.push_str("| --- | --- |\n");
+        output.push_str("| Component | Stroops | % of Total |\n");
+        output.push_str("| --- | --- | --- |\n");
+        let pct = &report.fee.fee_percentages;
         output.push_str(&format!(
-            "| Non-refundable | {} |\n",
-            report.fee.non_refundable_stroops
+            "| CPU Instructions | {} | {} |\n",
+            report.fee.cpu_fee_stroops,
+            pct.get("cpu_instructions")
+                .map(String::as_str)
+                .unwrap_or("")
         ));
         output.push_str(&format!(
-            "| Refundable | {} |\n",
-            report.fee.refundable_stroops
+            "| Storage I/O | {} | {} |\n",
+            report.fee.storage_fee_stroops,
+            pct.get("storage_read_write")
+                .map(String::as_str)
+                .unwrap_or("")
         ));
         output.push_str(&format!(
-            "| **Total** | **{}** ({}) |\n",
+            "| Transaction Size | {} | {} |\n",
+            report.fee.bandwidth_fee_stroops,
+            pct.get("transaction_size")
+                .map(String::as_str)
+                .unwrap_or("")
+        ));
+        output.push_str(&format!(
+            "| Base Fee | {} | {} |\n",
+            report.fee.base_fee_stroops,
+            pct.get("base_fee").map(String::as_str).unwrap_or("")
+        ));
+        output.push_str(&format!(
+            "| Rent Fee | {} | {} |\n",
+            report.fee.refundable_stroops,
+            pct.get("rent").map(String::as_str).unwrap_or("")
+        ));
+        output.push_str(&format!(
+            "| **Total** | **{}** ({}) | **100.0%** |\n",
             report.fee.total_stroops, report.fee.total_xlm,
         ));
+
+        // Optimization suggestions
+        output.push_str("\n### Optimization Suggestions\n\n");
+        let suggestions = report.suggest_optimizations();
+        if suggestions.is_empty() {
+            output.push_str(
+                "No cost optimizations identified (fee rates unavailable or no reducible resources).\n",
+            );
+        } else {
+            for s in &suggestions {
+                output.push_str(&format!(
+                    "- **{}**: {} (potential saving: {} stroops)\n",
+                    s.title, s.detail, s.potential_savings_stroops
+                ));
+            }
+        }
 
         output
     }
@@ -274,11 +391,18 @@ mod tests {
             fee: FeeBreakdown {
                 non_refundable_stroops: 4_496,
                 refundable_stroops: 10_931,
-                total_stroops: 15_427,
-                total_xlm: "0.0015427".to_string(),
+                cpu_fee_stroops: 372,
+                storage_fee_stroops: 4_063,
+                bandwidth_fee_stroops: 61,
+                base_fee_stroops: 100,
+                total_stroops: 15_527,
+                total_xlm: "0.0015527".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 3_894_195,
             network: "testnet".to_string(),
+            rpc_latency_ms: 87,
+            rates: None,
         }
     }
 
@@ -296,11 +420,18 @@ mod tests {
             fee: FeeBreakdown {
                 non_refundable_stroops: 0,
                 refundable_stroops: 0,
+                cpu_fee_stroops: 0,
+                storage_fee_stroops: 0,
+                bandwidth_fee_stroops: 0,
+                base_fee_stroops: 0,
                 total_stroops: 0,
                 total_xlm: "0.0000000".to_string(),
+                fee_percentages: std::collections::BTreeMap::new(),
             },
             ledger: 0,
             network: "mainnet".to_string(),
+            rpc_latency_ms: 0,
+            rates: None,
         }
     }
 
@@ -322,12 +453,20 @@ mod tests {
     }
 
     #[test]
+    fn test_table_formatter_contains_rpc_latency() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(output.contains("RPC round-trip: 87 ms"));
+    }
+
+    #[test]
     fn test_table_formatter_contains_fee_breakdown() {
         let formatter = TableFormatter;
         let output = formatter.format(&sample_report());
-        assert!(output.contains("Non-refundable: 4496 stroops"));
-        assert!(output.contains("Refundable:     10931 stroops"));
-        assert!(output.contains("Total:          15427 stroops (0.0015427)"));
+        assert!(output.contains("CPU Instructions"));
+        assert!(output.contains("Rent Fee"));
+        assert!(output.contains("Total"));
+        assert!(output.contains("15527 stroops (0.0015527)"));
     }
 
     #[test]
@@ -349,6 +488,40 @@ mod tests {
         assert_eq!(TableFormatter.to_string(), "table");
     }
 
+    #[test]
+    fn test_table_formatter_contains_chart() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&sample_report());
+        assert!(output.contains("Fee Breakdown Chart:"));
+        assert!(output.contains("Non-refundable"));
+        assert!(output.contains("Refundable"));
+        // Only rows after the chart header belong to the chart — the fee
+        // breakdown section above also names both components.
+        let chart_start = output
+            .find("Fee Breakdown Chart:")
+            .expect("table output should contain the fee breakdown chart");
+        let chart_lines: Vec<&str> = output[chart_start..]
+            .lines()
+            .filter(|l| l.contains("Non-refundable") || l.contains("Refundable"))
+            .collect();
+        assert_eq!(
+            chart_lines.len(),
+            2,
+            "chart should render one row per non-zero fee component"
+        );
+        for line in &chart_lines {
+            assert!(line.contains('#'), "chart line should contain '#': {line}");
+        }
+    }
+
+    #[test]
+    fn test_table_formatter_empty_report_no_chart() {
+        let formatter = TableFormatter;
+        let output = formatter.format(&empty_report());
+        // Chart section should not be present when all fees are zero
+        assert!(!output.contains("Fee Breakdown Chart:"));
+    }
+
     // ── JSON formatter ───────────────────────────────────────────────
 
     #[test]
@@ -368,8 +541,9 @@ mod tests {
         assert_eq!(parsed["wasm_hash"], "abc123def456");
         assert_eq!(parsed["ledger"], 3_894_195);
         assert_eq!(parsed["network"], "testnet");
-        assert_eq!(parsed["fee"]["total_stroops"], 15_427);
-        assert_eq!(parsed["fee"]["total_xlm"], "0.0015427");
+        assert_eq!(parsed["rpc_latency_ms"], 87);
+        assert_eq!(parsed["fee"]["total_stroops"], 15_527);
+        assert_eq!(parsed["fee"]["total_xlm"], "0.0015527");
     }
 
     #[test]
@@ -403,7 +577,7 @@ mod tests {
         let first_line = output.lines().next().unwrap();
         assert!(first_line.starts_with("function,"));
         let field_count = first_line.split(',').count();
-        assert_eq!(field_count, 15);
+        assert_eq!(field_count, 16);
     }
 
     #[test]
@@ -416,7 +590,7 @@ mod tests {
         assert!(data.contains("increment"));
         assert!(data.contains("testnet"));
         assert!(data.contains("532502"));
-        assert!(data.contains("15427"));
+        assert!(data.contains("15527"));
     }
 
     #[test]
@@ -489,9 +663,9 @@ mod tests {
         let formatter = MarkdownFormatter;
         let output = formatter.format(&sample_report());
         assert!(output.contains("### Fee Breakdown"));
-        assert!(output.contains("| Non-refundable | 4496 |"));
-        assert!(output.contains("| Refundable | 10931 |"));
-        assert!(output.contains("| **Total** | **15427** (0.0015427) |"));
+        assert!(output.contains("| CPU Instructions | 372 |"));
+        assert!(output.contains("| Rent Fee | 10931 |"));
+        assert!(output.contains("| **Total** | **15527** (0.0015527) |"));
     }
 
     #[test]
@@ -500,6 +674,7 @@ mod tests {
         let output = formatter.format(&sample_report());
         assert!(output.contains("**Network:** testnet (ledger 3894195)"));
         assert!(output.contains("**WASM hash:** `abc123def456`"));
+        assert!(output.contains("**RPC round-trip:** 87 ms"));
     }
 
     #[test]

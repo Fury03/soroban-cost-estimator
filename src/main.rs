@@ -63,9 +63,27 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             json,
         } => cmd_estimate_all(&wasm, &network, id.as_deref(), json).await,
         cli::Command::Config { action } => match action {
-            cli::ConfigAction::Snapshot { network, out, json } => {
-                cmd_config_snapshot(&network, out.as_deref(), json).await
-            }
+            cli::ConfigAction::Snapshot {
+                action,
+                network,
+                out,
+                json,
+            } => match action {
+                Some(cli::SnapshotAction::Show {
+                    snapshot,
+                    at,
+                    latest,
+                    network: show_network,
+                    json: show_json,
+                }) => cmd_config_snapshot_show(
+                    snapshot.as_deref(),
+                    at.as_deref(),
+                    latest,
+                    show_network.as_deref(),
+                    show_json,
+                ),
+                None => cmd_config_snapshot(&network, out.as_deref(), json).await,
+            },
             cli::ConfigAction::Diff { network, against } => {
                 cmd_config_diff(&network, against.as_deref()).await
             }
@@ -781,6 +799,40 @@ async fn cmd_config_snapshot(
     }
     .instrument(span)
     .await
+}
+
+/// `config snapshot show` command: display a stored snapshot.
+///
+/// Selects the snapshot by explicit path, by timestamp (`--at`, exact or
+/// prefix), or the latest stored one (`--latest`, also the default with no
+/// selector). Network calls: none — pure file I/O.
+fn cmd_config_snapshot_show(
+    path: Option<&str>,
+    at: Option<&str>,
+    latest: bool,
+    network: Option<&str>,
+    json_flag: bool,
+) -> error::AppResult<()> {
+    let network = network.unwrap_or("testnet");
+    let snapshot = if let Some(path) = path {
+        config_snapshot::store::load_snapshot_from_path(path)?
+    } else if let Some(timestamp) = at {
+        config_snapshot::store::resolve_snapshot_by_timestamp(network, timestamp)?
+    } else {
+        // `--latest` and the no-selector default behave identically.
+        let _ = latest;
+        config_snapshot::store::load_latest_snapshot(network)?
+    };
+
+    if json_flag {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        println!(
+            "{}",
+            config_snapshot::display::format_snapshot_details(&snapshot)
+        );
+    }
+    Ok(())
 }
 
 /// True when a config diff signals a network protocol/config upgrade.

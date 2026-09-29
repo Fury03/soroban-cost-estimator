@@ -104,9 +104,47 @@ pub enum CacheAction {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum SnapshotAction {
+    /// Display the complete configuration stored in a historical snapshot.
+    ///
+    /// Selects the snapshot to show by explicit file path, by timestamp
+    /// (`--at`, exact or prefix within the network's snapshot history), or
+    /// the most recent one (`--latest`, also the default with no selector).
+    Show {
+        /// Snapshot file path to display (overrides `--at` and `--latest`).
+        snapshot: Option<String>,
+
+        /// Timestamp (exact or prefix, e.g. `2026-08-04` or `2026-08-04T07`)
+        /// of the snapshot to show. When several snapshots match the prefix,
+        /// the most recent one is used.
+        #[arg(long, conflicts_with = "snapshot")]
+        at: Option<String>,
+
+        /// Show the most recent snapshot for the network.
+        #[arg(long, conflicts_with_all = ["snapshot", "at"])]
+        latest: bool,
+
+        /// Network whose snapshot history to search when no explicit path
+        /// is given.
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Print the snapshot as JSON instead of a formatted report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ConfigAction {
     /// Fetch all ConfigSetting entries and save a timestamped snapshot.
+    ///
+    /// With no subcommand, fetches and saves a new snapshot. With the `show`
+    /// subcommand, displays a stored one instead.
     Snapshot {
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
+
         /// Network to fetch config from.
         #[arg(long, default_value = "testnet")]
         network: String,

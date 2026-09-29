@@ -347,7 +347,7 @@ fn test_estimate_nonexistent_wasm_file() {
     );
     assert!(
         stderr.contains("Error: File not found"),
-        "runtime failures are reported on stderr as `Error: …`; got: {stderr}"
+        "runtime failures are reported on stderr as `Error: …` (after any tracing \n    logs, which also go to stderr); got: {stderr}"
     );
     assert!(
         stderr.contains("File not found"),
@@ -776,8 +776,8 @@ fn test_watch_unknown_network_is_non_fatal() {
 
 #[test]
 fn test_watch_interval_suffixes_are_parsed() {
-    // `30m` must resolve to 1800s in the banner — the interval parser is unit
-    // tested in-crate, this pins the wiring through the CLI.
+    // `30m` must resolve to 1800s in the banner — the interval parser is
+    // unit tested in-crate, this pins the wiring through the CLI.
     let home = temp_home("watch-interval");
     let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
         .args(["watch", "--network", "not-a-network", "--interval", "30m"])
@@ -904,5 +904,202 @@ fn test_cache_verify_clean_summary_exits_0() {
     assert!(
         stdout.contains("Verified 1 cache files: 1 valid, 0 corrupted"),
         "summary must be printed for a valid cache too; got: {stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `config snapshot show` (#344)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_snapshot_show_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "show", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config snapshot show --help should exit 0; stderr: {stderr}"
+    );
+    for flag in ["--at", "--latest", "--network", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "show help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_snapshot_show_latest_prints_metadata_and_table() {
+    let home = temp_home("show-latest");
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    std::fs::write(
+        dir.join("testnet-2026-08-04T07-15-38+00-00.json"),
+        snapshot_json("testnet", 3_470_630),
+    )
+    .expect("write snapshot");
+
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["config", "snapshot", "show", "--latest"], Some(&home));
+    assert_eq!(code, 0, "show --latest should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Network: testnet"),
+        "metadata header; got: {stdout}"
+    );
+    assert!(stdout.contains("Timestamp: 2026-01-01T00:00:00+00:00"));
+    assert!(stdout.contains("Ledger: 3470630"));
+    assert!(
+        stdout.contains("Protocol version: (unknown)"),
+        "old snapshots lack a protocol version"
+    );
+    // Category tables render even when the snapshot carries null sections.
+    assert!(stdout.contains("(not captured)"));
+}
+
+#[test]
+fn test_config_snapshot_show_defaults_to_latest_without_selector() {
+    let home = temp_home("show-default");
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    std::fs::write(
+        dir.join("testnet-2026-08-04T07-15-38+00-00.json"),
+        snapshot_json("testnet", 100),
+    )
+    .expect("write snapshot");
+
+    let (stdout, _stderr, code) = run_cli_in_home(&["config", "snapshot", "show"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "show with no selector shows the latest; stdout: {stdout}"
+    );
+    assert!(stdout.contains("Ledger: 100"));
+}
+
+#[test]
+fn test_config_snapshot_show_at_prefix() {
+    let home = temp_home("show-at");
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    std::fs::write(
+        dir.join("testnet-2026-08-04T07-15-38+00-00.json"),
+        snapshot_json("testnet", 111),
+    )
+    .expect("write snapshot a");
+    std::fs::write(
+        dir.join("testnet-2026-08-05T09-30-00+00-00.json"),
+        snapshot_json("testnet", 222),
+    )
+    .expect("write snapshot b");
+
+    // Day prefix resolves to the most recent snapshot of that day.
+    let (stdout, _stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "show", "--at", "2026-08-04"],
+        Some(&home),
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Ledger: 111"), "got: {stdout}");
+
+    // A prefix matching nothing errors with SnapshotNotFound.
+    let (_, stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "show", "--at", "2025-01-01"],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "an unmatched timestamp must error");
+    assert!(
+        stderr.contains("Snapshot not found"),
+        "error must be SnapshotNotFound; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_show_explicit_path() {
+    let home = temp_home("show-path");
+    let path = home.join("explicit.json");
+    std::fs::write(&path, snapshot_json("mainnet", 555)).expect("write snapshot");
+
+    let (stdout, _stderr, code) = run_cli_in_home(
+        &["config", "snapshot", "show", path.to_str().unwrap()],
+        Some(&home),
+    );
+    assert_eq!(code, 0, "an explicit path must load; stdout: {stdout}");
+    assert!(stdout.contains("Network: mainnet"));
+    assert!(stdout.contains("Ledger: 555"));
+}
+
+#[test]
+fn test_config_snapshot_show_json_mode() {
+    let home = temp_home("show-json");
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    std::fs::write(
+        dir.join("testnet-2026-08-04T07-15-38+00-00.json"),
+        snapshot_json("testnet", 3_470_630),
+    )
+    .expect("write snapshot");
+
+    let (stdout, _stderr, code) =
+        run_cli_in_home(&["config", "snapshot", "show", "--json"], Some(&home));
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("show --json must print valid JSON; got: {stdout}");
+    assert_eq!(parsed["network"], "testnet");
+    assert_eq!(parsed["ledger"], 3_470_630);
+}
+
+#[test]
+fn test_config_snapshot_show_without_snapshots_errors() {
+    let home = temp_home("show-empty");
+    let (_, stderr, code) =
+        run_cli_in_home(&["config", "snapshot", "show", "--latest"], Some(&home));
+    assert_eq!(code, 1, "no snapshots to show must exit 1");
+    assert!(
+        stderr.contains("No snapshots available for network: testnet"),
+        "the error should name the network; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_show_network_flag_selects_history() {
+    let home = temp_home("show-network");
+    let dir = home.join(".soroban-cost-estimator").join("snapshots");
+    std::fs::create_dir_all(&dir).expect("create snapshots dir");
+    std::fs::write(
+        dir.join("mainnet-2026-08-04T07-15-38+00-00.json"),
+        snapshot_json("mainnet", 777),
+    )
+    .expect("write mainnet snapshot");
+
+    let (stdout, _stderr, code) = run_cli_in_home(
+        &[
+            "config",
+            "snapshot",
+            "show",
+            "--latest",
+            "--network",
+            "mainnet",
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Network: mainnet"));
+    assert!(stdout.contains("Ledger: 777"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `config snapshot show` selector conflicts
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_config_snapshot_show_conflicting_selectors_error() {
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "show",
+        "--latest",
+        "--at",
+        "2026-08-04",
+    ]);
+    assert_ne!(code, 0, "--latest and --at are mutually exclusive");
+    assert!(
+        stderr.contains("cannot be used") || stderr.to_lowercase().contains("error"),
+        "clap must reject the conflicting flags; got: {stderr}"
     );
 }

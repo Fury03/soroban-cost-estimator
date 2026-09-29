@@ -74,7 +74,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
         },
         cli::Command::Watch { network, interval } => cmd_watch(&network, &interval).await,
         cli::Command::Cache { action } => match action {
-            cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Verify { repair } => cmd_cache_verify(repair),
         },
     }
 }
@@ -903,15 +903,21 @@ async fn cmd_watch(network: &str, interval: &str) -> error::AppResult<()> {
     }
 }
 
-/// `cache verify` command: check every cache entry parses as valid JSON.
+/// `cache verify` command: check every cache entry parses as valid JSON and
+/// matches the cache schema.
 ///
-/// Prints a summary line per corrupted entry and exits with code 1 when any
-/// entry fails verification, so scripts can treat a corrupt cache as an
-/// error. A healthy (or empty) cache exits 0.
+/// Prints the per-file problems and a summary in the form
+/// `Verified X cache files: Y valid, Z corrupted`, then exits with code 1
+/// when any entry fails verification, so scripts can treat a corrupt cache
+/// as an error. A healthy (or empty) cache exits 0.
+///
+/// With `repair` (or `--fix`), corrupted entries are deleted instead of only
+/// reported; a repaired cache is healthy, so repair always exits 0 when the
+/// removal itself succeeds.
 ///
 /// # Network calls
 /// None — pure file I/O.
-fn cmd_cache_verify() -> error::AppResult<()> {
+fn cmd_cache_verify(repair: bool) -> error::AppResult<()> {
     use tracing::debug;
 
     let statuses = cache::verify_cache()?;
@@ -924,19 +930,30 @@ fn cmd_cache_verify() -> error::AppResult<()> {
 
     let total = statuses.len();
     let corrupt: Vec<&cache::CacheEntryStatus> = statuses.iter().filter(|s| !s.valid).collect();
+    let valid = total - corrupt.len();
 
-    println!("Checked {total} cache entries.");
+    for status in &corrupt {
+        println!("Corrupted cache entry: {}", status.filename);
+    }
+
+    if repair && !corrupt.is_empty() {
+        let removed = cache::repair_cache()?;
+        println!("Removed {} corrupted cache file(s).", removed.len());
+    }
 
     if corrupt.is_empty() {
-        println!("All cache entries are valid.");
-    } else {
+        println!("Verified {total} cache files: {valid} valid, 0 corrupted");
+    } else if repair {
         println!(
-            "{} of {total} cache entries failed verification:",
+            "Verified {total} cache files: {valid} valid, {} corrupted (removed)",
             corrupt.len()
         );
-        for status in &corrupt {
-            println!("  - {}", status.filename);
-        }
+    } else {
+        println!(
+            "Verified {total} cache files: {valid} valid, {} corrupted",
+            corrupt.len()
+        );
+        println!("Run `cache verify --repair` to remove the corrupted files.");
         std::process::exit(1);
     }
 

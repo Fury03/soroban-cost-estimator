@@ -96,7 +96,11 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
     /// Check that every cached estimate is valid JSON and not corrupted.
-    Verify,
+    Verify {
+        /// Delete corrupted cache entries instead of only reporting them.
+        #[arg(long, visible_alias = "fix")]
+        repair: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

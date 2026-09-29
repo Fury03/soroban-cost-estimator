@@ -377,6 +377,34 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
     Ok(statuses)
 }
 
+/// Removes every corrupted entry reported by [`verify_cache`] from disk.
+///
+/// Returns the sorted filenames that were deleted. A file that cannot be
+/// deleted aborts the repair with the underlying I/O error, so the caller
+/// surfaces it instead of silently pretending the cache is clean.
+///
+/// Entries written by a *newer* schema (version greater than
+/// [`CACHE_SCHEMA_VERSION`]) count as corrupted here and are removed too —
+/// they cannot be safely read by this build.
+///
+/// # Network calls
+/// None — pure file I/O.
+pub fn repair_cache() -> AppResult<Vec<String>> {
+    let statuses = verify_cache()?;
+    let dir = cache_dir()?;
+
+    let mut removed = Vec::new();
+    for status in statuses.iter().filter(|s| !s.valid) {
+        let path = dir.join(&status.filename);
+        std::fs::remove_file(&path)?;
+        debug!(filename = %status.filename, "removed corrupted cache entry");
+        removed.push(status.filename.clone());
+    }
+
+    debug!(removed = removed.len(), "cache repair complete");
+    Ok(removed)
+}
+
 /// Check which cached estimates are now stale (simulated at an earlier ledger).
 ///
 /// Returns a list of cached estimates that were made before `current_ledger`.

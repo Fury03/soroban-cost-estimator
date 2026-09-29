@@ -428,6 +428,100 @@ fn test_load_estimate_rejects_mismatched_args_hash() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Cache repair (#342)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `repair_cache` deletes every corrupted entry and keeps every valid one,
+/// after which the cache verifies clean.
+#[test]
+fn test_repair_cache_removes_corrupted_entries() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save f1");
+        cache::save_estimate("h2", "f2", &[], "testnet", 2, 200, 20, 10).expect("save f2");
+
+        let dir = dirs::home_dir()
+            .expect("home")
+            .join(".soroban-cost-estimator")
+            .join("cache");
+        std::fs::write(dir.join("garbage.json"), "{not json").expect("write garbage");
+        std::fs::write(dir.join("wrong_shape.json"), r#"{"foo": 1}"#).expect("write wrong shape");
+
+        let before = cache::verify_cache().expect("verify before repair");
+        assert_eq!(before.len(), 4);
+        assert_eq!(before.iter().filter(|s| !s.valid).count(), 2);
+
+        let removed = cache::repair_cache().expect("repair");
+        let mut names = removed;
+        names.sort();
+        assert_eq!(names, vec!["garbage.json", "wrong_shape.json"]);
+
+        let after = cache::verify_cache().expect("verify after repair");
+        assert_eq!(after.len(), 2, "only valid entries should remain");
+        assert!(after.iter().all(|s| s.valid));
+    });
+}
+
+/// Repairing a clean cache is a no-op.
+#[test]
+fn test_repair_cache_on_clean_cache_is_noop() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save");
+        let removed = cache::repair_cache().expect("repair");
+        assert!(
+            removed.is_empty(),
+            "nothing should be removed from a clean cache"
+        );
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].valid);
+    });
+}
+
+/// Entries carrying a schema newer than this build understands are removed
+/// by repair too: they cannot be safely read, so keeping them would leave
+/// the cache unusable for `list_cached_estimates` consumers.
+#[test]
+fn test_repair_cache_removes_newer_schema_entries() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("save");
+
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        let mut future = json!({
+            "wasm_hash": "h_future",
+            "function": "f_future",
+            "args_hash": "00",
+            "network": "testnet",
+            "ledger": 1,
+            "total_stroops": 1,
+            "cpu_instructions": 1,
+            "memory_bytes": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "version": cache::CACHE_SCHEMA_VERSION + 1,
+        });
+        future["args_hash"] = json!(hex::encode(sha2::Sha256::digest(b"")));
+        std::fs::write(
+            dir.join(format!(
+                "h_future-f_future-{}.json",
+                hex::encode(sha2::Sha256::digest(b""))
+            )),
+            future.to_string(),
+        )
+        .expect("write future entry");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.iter().filter(|s| !s.valid).count(), 1);
+
+        let removed = cache::repair_cache().expect("repair");
+        assert_eq!(
+            removed.len(),
+            1,
+            "the future-schema entry should be removed"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Concurrency
 // ─────────────────────────────────────────────────────────────────────────
 

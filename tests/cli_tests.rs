@@ -796,3 +796,113 @@ fn test_watch_interval_suffixes_are_parsed() {
         "`30m` should resolve to 1800s; got: {stdout}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `cache verify --repair` (#342)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Seeds the cache dir inside `home` with one valid entry and one corrupt
+/// file; returns the cache dir path.
+fn seed_valid_and_corrupt_cache(home: &Path) {
+    let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
+    let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+    let args_hash = hex::encode(sha2::Sha256::digest(b""));
+
+    let cache_dir = home.join(".soroban-cost-estimator").join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+    let valid = json!({
+        "wasm_hash": wasm_hash,
+        "function": "(wasm upload)",
+        "args_hash": args_hash,
+        "network": "testnet",
+        "ledger": 42,
+        "total_stroops": 1_000,
+        "cpu_instructions": 500,
+        "memory_bytes": 250,
+        "timestamp": "2026-01-01T00:00:00Z",
+    });
+    std::fs::write(
+        cache_dir.join(format!("{wasm_hash}-(wasm upload)-{args_hash}.json")),
+        valid.to_string(),
+    )
+    .expect("write valid entry");
+
+    std::fs::write(cache_dir.join("garbage.json"), "{not json").expect("write garbage");
+}
+
+#[test]
+fn test_cache_verify_reports_summary_and_exits_1_on_corruption() {
+    let home = temp_home("verify-corrupt");
+    seed_valid_and_corrupt_cache(&home);
+
+    let (stdout, _stderr, code) = run_cli_in_home(&["cache", "verify"], Some(&home));
+    assert_eq!(code, 1, "corrupted entries must exit 1; stdout: {stdout}");
+    assert!(
+        stdout.contains("Corrupted cache entry: garbage.json"),
+        "each corrupted file must be named; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Verified 2 cache files: 1 valid, 1 corrupted"),
+        "summary must be `Verified X cache files: Y valid, Z corrupted`; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--repair"),
+        "the report must point at the repair flag; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_verify_repair_removes_corrupted_and_exits_0() {
+    let home = temp_home("verify-repair");
+    seed_valid_and_corrupt_cache(&home);
+
+    let (stdout, _stderr, code) = run_cli_in_home(&["cache", "verify", "--repair"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "repair must exit 0 after removing corruption; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Removed 1 corrupted cache file(s)."),
+        "repair must announce what it removed; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 corrupted (removed)"),
+        "summary must mark corrupted entries as removed; got: {stdout}"
+    );
+
+    // The garbage file is gone; the valid entry survives.
+    let cache_dir = home.join(".soroban-cost-estimator").join("cache");
+    assert!(
+        !cache_dir.join("garbage.json").exists(),
+        "corrupt file must be deleted"
+    );
+    assert_eq!(std::fs::read_dir(&cache_dir).expect("readdir").count(), 1);
+
+    // A second verify is now clean.
+    let (stdout, _stderr, code) = run_cli_in_home(&["cache", "verify"], Some(&home));
+    assert_eq!(code, 0, "a repaired cache verifies clean");
+    assert!(stdout.contains("Verified 1 cache files: 1 valid, 0 corrupted"));
+}
+
+#[test]
+fn test_cache_verify_fix_alias_works() {
+    let home = temp_home("verify-fix");
+    seed_valid_and_corrupt_cache(&home);
+
+    let (_stdout, _stderr, code) = run_cli_in_home(&["cache", "verify", "--fix"], Some(&home));
+    assert_eq!(code, 0, "--fix is an alias for --repair");
+}
+
+#[test]
+fn test_cache_verify_clean_summary_exits_0() {
+    let home = temp_home("verify-clean");
+    seed_cache_entry(&home, "2026-01-01T00:00:00Z");
+
+    let (stdout, _stderr, code) = run_cli_in_home(&["cache", "verify"], Some(&home));
+    assert_eq!(code, 0, "a valid cache exits 0; stdout: {stdout}");
+    assert!(
+        stdout.contains("Verified 1 cache files: 1 valid, 0 corrupted"),
+        "summary must be printed for a valid cache too; got: {stdout}"
+    );
+}

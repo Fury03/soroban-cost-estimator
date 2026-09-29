@@ -589,6 +589,16 @@ async fn fetch_config_snapshot(
         if let Some(latest) = raw_entries.iter().map(|e| e.last_modified_ledger).max() {
             snapshot.ledger = latest;
         }
+
+        // Record the network's protocol version so snapshots can anchor
+        // automatic protocol-upgrade capture. A server that does not report
+        // it degrades to `None` ("unknown") rather than failing the fetch —
+        // the config settings themselves are still valid.
+        match rpc::config::fetch_network_protocol_version(&client).await {
+            Ok(version) => snapshot.network_protocol_version = Some(version),
+            Err(e) => debug!(error = %e, "could not fetch protocol version"),
+        }
+
         debug!(ledger = snapshot.ledger, "config snapshot built");
         Ok(snapshot)
     }
@@ -624,6 +634,113 @@ fn print_stale_estimates(network: &str, ledger: u32) {
     }
 }
 
+/// A detected increase of the network's protocol version relative to the
+/// most recent stored snapshot.
+struct ProtocolUpgrade {
+    /// Protocol version of the previous snapshot (`None` when that snapshot
+    /// predates protocol tracking).
+    from: Option<u32>,
+    /// Protocol version the network now reports.
+    to: u32,
+    /// The previous snapshot the transition was measured against — the
+    /// baseline for the automatic post-upgrade diff.
+    previous: config_snapshot::model::ConfigSnapshot,
+}
+
+/// True when the new snapshot reports a strictly higher protocol version
+/// than the stored one. A previous snapshot without a recorded version can
+/// claim no transition (it predates tracking, not the network).
+fn is_protocol_upgrade(
+    old: &config_snapshot::model::ConfigSnapshot,
+    new: &config_snapshot::model::ConfigSnapshot,
+) -> bool {
+    match (old.network_protocol_version, new.network_protocol_version) {
+        (Some(old_v), Some(new_v)) => new_v > old_v,
+        _ => false,
+    }
+}
+
+/// Compares a freshly fetched snapshot against the most recent stored
+/// snapshot; when the network's protocol version increased, annotates the
+/// new snapshot with a `protocol_upgrade_v{N}` tag and returns the details
+/// of the transition.
+///
+/// The stored snapshot cannot exist (first snapshot ever) or cannot be
+/// read: logged and treated as "no upgrade" rather than failing a command
+/// whose primary job — capturing the snapshot — has already succeeded.
+///
+/// # Network calls
+/// None — pure file I/O (plus whatever the caller did to fetch `snapshot`).
+fn annotate_protocol_upgrade(
+    network: &str,
+    snapshot: &mut config_snapshot::model::ConfigSnapshot,
+) -> Option<ProtocolUpgrade> {
+    use tracing::debug;
+
+    let previous = match config_snapshot::store::load_latest_snapshot(network) {
+        Ok(prev) => prev,
+        Err(e) => {
+            debug!(error = %e, "no previous snapshot to compare protocol version against");
+            return None;
+        }
+    };
+    if !is_protocol_upgrade(&previous, snapshot) {
+        return None;
+    }
+    let upgrade = ProtocolUpgrade {
+        from: previous.network_protocol_version,
+        to: snapshot.network_protocol_version.unwrap_or_default(),
+        previous,
+    };
+    snapshot
+        .tags
+        .push(format!("protocol_upgrade_v{}", upgrade.to));
+    debug!(from = ?upgrade.from, to = upgrade.to, "protocol upgrade detected");
+    Some(upgrade)
+}
+
+/// Builds the protocol-upgrade notice: the required
+/// `🎉 Stellar Protocol Upgrade detected (vX -> vY). Created snapshot: <path>`
+/// line, optionally followed by the automatic field-level diff against the
+/// previous protocol version's snapshot.
+fn format_protocol_upgrade_announcement(
+    upgrade: &ProtocolUpgrade,
+    snapshot: &config_snapshot::model::ConfigSnapshot,
+    path: &std::path::Path,
+    include_diff: bool,
+) -> String {
+    let from = upgrade
+        .from
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let mut message = format!(
+        "🎉 Stellar Protocol Upgrade detected (v{from} -> v{}). Created snapshot: {}",
+        upgrade.to,
+        path.display()
+    );
+    if include_diff {
+        let diff = config_snapshot::diff::diff_snapshots(&upgrade.previous, snapshot);
+        message.push('\n');
+        message.push_str(&config_snapshot::diff::format_diff(&diff));
+    }
+    message
+}
+
+/// Prints the protocol-upgrade notice with the created snapshot's path and,
+/// when the caller has not already diffed this exact pair, the automatic
+/// field-level diff against the previous protocol version's snapshot.
+fn announce_protocol_upgrade(
+    upgrade: &ProtocolUpgrade,
+    snapshot: &config_snapshot::model::ConfigSnapshot,
+    path: &std::path::Path,
+    include_diff: bool,
+) {
+    println!(
+        "{}",
+        format_protocol_upgrade_announcement(upgrade, snapshot, path, include_diff)
+    );
+}
+
 /// `config snapshot` command: fetch config settings and save snapshot.
 async fn cmd_config_snapshot(
     network: &str,
@@ -636,14 +753,25 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot = fetch_config_snapshot(network).await?;
+        let mut snapshot = fetch_config_snapshot(network).await?;
+
+        let upgrade = annotate_protocol_upgrade(network, &mut snapshot);
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
 
         if json_flag {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            if let Some(upgrade) = &upgrade {
+                // JSON mode must stay machine-parseable: the notice and the
+                // automatic diff go to stderr.
+                announce_protocol_upgrade(upgrade, &snapshot, &path, false);
+            }
             return Ok(());
+        }
+
+        if let Some(upgrade) = &upgrade {
+            announce_protocol_upgrade(upgrade, &snapshot, &path, true);
         }
         println!("Config snapshot saved to: {}", path.display());
         println!("Network: {}", snapshot.network);
@@ -682,7 +810,7 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
             }
         };
 
-        let new_snapshot = fetch_config_snapshot(network).await?;
+        let mut new_snapshot = fetch_config_snapshot(network).await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -692,7 +820,29 @@ async fn cmd_config_diff(network: &str, against_path: Option<&str>) -> error::Ap
         );
         println!("{}", config_snapshot::diff::format_diff(&diff));
 
-        if upgrade_detected(&diff) {
+        // A protocol-version increase creates an annotated snapshot of its
+        // own, even when no pricing field moved. When the compared baseline
+        // was the latest stored snapshot (no explicit --against), its diff
+        // was already printed above, so the upgrade notice skips the repeat.
+        let protocol_upgrade = annotate_protocol_upgrade(network, &mut new_snapshot);
+
+        if let Some(upgrade) = &protocol_upgrade {
+            match config_snapshot::store::save_snapshot(&new_snapshot, None) {
+                Ok(path) => {
+                    info!(path = %path.display(), "auto-saved protocol-upgrade snapshot");
+                    announce_protocol_upgrade(
+                        upgrade,
+                        &new_snapshot,
+                        &path,
+                        against_path.is_some(),
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not auto-save protocol-upgrade snapshot");
+                    eprintln!("  Warning: could not auto-save protocol-upgrade snapshot: {e}");
+                }
+            }
+        } else if upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
@@ -846,7 +996,7 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
     use tracing::{debug, warn};
 
     match fetch_config_snapshot(network).await {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
                     let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &snapshot);
@@ -859,7 +1009,14 @@ async fn watch_poll_once(network: &str, first: &mut bool) -> error::AppResult<()
                 }
             }
 
-            let _ = config_snapshot::store::save_snapshot(&snapshot, None);
+            // A protocol-version increase between polls captures an
+            // annotated snapshot; the diff against the previous protocol
+            // version was already printed above when changes were reported.
+            let upgrade = annotate_protocol_upgrade(network, &mut snapshot);
+            let saved = config_snapshot::store::save_snapshot(&snapshot, None).ok();
+            if let (Some(upgrade), Some(path)) = (&upgrade, saved.as_ref()) {
+                announce_protocol_upgrade(upgrade, &snapshot, path, false);
+            }
             *first = false;
         }
         Err(e) => {
@@ -974,6 +1131,7 @@ mod tests {
             network: "testnet".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             ledger: 100,
+            network_protocol_version: None,
             contract_compute: Some(ContractComputeV0 {
                 ledger_max_instructions: 1_000_000,
                 tx_max_instructions: 100_000,
@@ -985,6 +1143,7 @@ mod tests {
             contract_events: None,
             contract_bandwidth: None,
             state_archival: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1077,5 +1236,196 @@ mod tests {
 
         assert!(!diff.has_pricing_changes);
         assert!(!upgrade_detected(&diff));
+    }
+
+    fn snapshot_with_protocol(version: Option<u32>, fee: i64) -> ConfigSnapshot {
+        let mut snap = snapshot_with_compute_fee(fee);
+        snap.network_protocol_version = version;
+        snap
+    }
+
+    #[test]
+    fn test_is_protocol_upgrade_on_version_increase() {
+        let old = snapshot_with_protocol(Some(21), 5);
+        let new = snapshot_with_protocol(Some(22), 5);
+        assert!(super::is_protocol_upgrade(&old, &new));
+    }
+
+    #[test]
+    fn test_is_not_protocol_upgrade_on_same_or_older_version() {
+        let v21 = snapshot_with_protocol(Some(21), 5);
+        let v22 = snapshot_with_protocol(Some(22), 5);
+
+        assert!(
+            !super::is_protocol_upgrade(&v21, &v21),
+            "same version is not an upgrade"
+        );
+        assert!(
+            !super::is_protocol_upgrade(&v22, &v21),
+            "a version decrease is not an upgrade (never annotate on rollback)"
+        );
+    }
+
+    #[test]
+    fn test_is_not_protocol_upgrade_without_previous_version() {
+        // The previous snapshot predates protocol tracking, so it cannot
+        // claim a transition; the new snapshot's version alone proves
+        // nothing about a change.
+        let old = snapshot_with_protocol(None, 5);
+        let new = snapshot_with_protocol(Some(22), 5);
+        assert!(!super::is_protocol_upgrade(&old, &new));
+
+        // Symmetrically, a new snapshot without a version can neither
+        // confirm nor deny an upgrade.
+        let old = snapshot_with_protocol(Some(21), 5);
+        let new = snapshot_with_protocol(None, 5);
+        assert!(!super::is_protocol_upgrade(&old, &new));
+    }
+
+    /// Serializes tests that redirect `HOME` (env vars are process-global).
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `f` with `HOME` pointed at a fresh temp dir, restoring it after.
+    fn with_temp_home_blocking<F, R>(label: &str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = HOME_LOCK.lock().expect("test mutex");
+        let tmp = std::env::temp_dir().join(format!("sce-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp home");
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: serialized by HOME_LOCK; no other test in this binary
+        // reads HOME.
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+        let result = f();
+        // SAFETY: as above.
+        if let Some(home) = old_home {
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        result
+    }
+
+    #[test]
+    fn test_annotate_protocol_upgrade_tags_snapshot_and_reports_transition() {
+        with_temp_home_blocking("annotate-upgrade", || {
+            // Seed a stored snapshot captured at protocol 21.
+            let previous = snapshot_with_protocol(Some(21), 100);
+            soroban_cost_estimator::config_snapshot::store::save_snapshot(&previous, None)
+                .expect("seed previous snapshot");
+
+            let mut new = snapshot_with_protocol(Some(22), 100);
+            let upgrade = super::annotate_protocol_upgrade("testnet", &mut new)
+                .expect("upgrade should be detected");
+            assert_eq!(upgrade.from, Some(21));
+            assert_eq!(upgrade.to, 22);
+            assert_eq!(
+                new.tags,
+                vec!["protocol_upgrade_v22".to_string()],
+                "snapshot must be tagged with protocol_upgrade_v{{version}}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_annotate_protocol_upgrade_ignores_unchanged_version() {
+        with_temp_home_blocking("annotate-same", || {
+            let previous = snapshot_with_protocol(Some(21), 100);
+            soroban_cost_estimator::config_snapshot::store::save_snapshot(&previous, None)
+                .expect("seed previous snapshot");
+
+            let mut new = snapshot_with_protocol(Some(21), 200);
+            assert!(
+                super::annotate_protocol_upgrade("testnet", &mut new).is_none(),
+                "an unchanged protocol version must not be annotated"
+            );
+            assert!(new.tags.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_annotate_protocol_upgrade_without_prior_snapshot_is_noop() {
+        with_temp_home_blocking("annotate-no-prior", || {
+            let mut new = snapshot_with_protocol(Some(22), 100);
+            assert!(
+                super::annotate_protocol_upgrade("testnet", &mut new).is_none(),
+                "the first-ever snapshot has no previous protocol version to beat"
+            );
+            assert!(new.tags.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_protocol_upgrade_announcement_matches_required_format() {
+        let previous = snapshot_with_protocol(Some(21), 100);
+        let mut new = snapshot_with_protocol(Some(22), 100);
+        if let Some(compute) = &mut new.contract_compute {
+            compute.fee_rate_per_instructions_increment = 200;
+        }
+        new.tags.push("protocol_upgrade_v22".to_string());
+        let upgrade = super::ProtocolUpgrade {
+            from: Some(21),
+            to: 22,
+            previous: previous.clone(),
+        };
+
+        let message = super::format_protocol_upgrade_announcement(
+            &upgrade,
+            &new,
+            std::path::Path::new("/tmp/snap.json"),
+            false,
+        );
+        assert!(
+            message.contains("🎉 Stellar Protocol Upgrade detected (v21 -> v22). Created snapshot: /tmp/snap.json"),
+            "the notice must match the required wording; got: {message}"
+        );
+        assert!(
+            !message.contains("fee_rate"),
+            "no diff when include_diff is false"
+        );
+
+        let with_diff = super::format_protocol_upgrade_announcement(
+            &upgrade,
+            &new,
+            std::path::Path::new("/tmp/snap.json"),
+            true,
+        );
+        assert!(
+            with_diff.contains("fee_rate_per_instructions_increment"),
+            "the automatic diff against the previous protocol version must be included; got: {with_diff}"
+        );
+        assert!(with_diff.contains("100"));
+        assert!(with_diff.contains("200"));
+    }
+
+    #[test]
+    fn test_protocol_upgrade_announcement_handles_unknown_previous_version() {
+        let previous = snapshot_with_protocol(None, 100);
+        let new = snapshot_with_protocol(Some(22), 100);
+        let upgrade = super::ProtocolUpgrade {
+            from: None,
+            to: 22,
+            previous,
+        };
+
+        let message = super::format_protocol_upgrade_announcement(
+            &upgrade,
+            &new,
+            std::path::Path::new("/tmp/snap.json"),
+            false,
+        );
+        assert!(
+            message.contains("(v? -> v22)"),
+            "a pre-tracking previous version renders as '?'; got: {message}"
+        );
     }
 }
